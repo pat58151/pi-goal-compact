@@ -1,0 +1,25 @@
+{
+  "name": "pi-goal-compact",
+  "version": "1.0.0",
+  "description": "Goal-aware context compaction for pi: mid-run compaction triggers plus verbatim pre-compaction checkpoints.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "extension",
+    "compaction",
+    "goal",
+    "context"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}
