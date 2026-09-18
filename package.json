@@ -1,7 +1,7 @@
 {
   "name": "pi-goal-compact",
-  "version": "1.0.0",
-  "description": "Goal-aware context compaction for pi: mid-run compaction triggers plus verbatim pre-compaction checkpoints.",
+  "version": "1.1.0",
+  "description": "Goal-aware context compaction for pi: verbatim pre-compaction checkpoints and goal-focused summaries.",
   "type": "module",
   "license": "MIT",
   "files": [
