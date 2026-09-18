@@ -1,32 +1,38 @@
 /**
  * Goal-aware compaction
  *
- * pi already compacts on its own: threshold compaction runs before each next
- * assistant response inside a run (`prepareNextTurnWithContext` ->
- * `_compactBeforeNextAssistantResponse`), again after a run ends
- * (`_handlePostAgentRun` -> `_checkCompaction`), on context overflow, and on
- * manual `/compact`. This extension deliberately adds no trigger of its own and
- * never calls `ctx.compact()`. It makes pi's existing compactions behave better:
+ * pi compacts on its own: threshold compaction runs before each next assistant
+ * response inside a run, again after a run ends, on context overflow, and on manual
+ * `/compact`. This extension makes those compactions preserve working state, and it
+ * also carries its own mid-run trigger, because pi cannot always do the job:
  *
- * 1. Pre-compaction checkpoint. A fixed amount of tokens *before* pi's threshold
- *    (`contextWindow - compaction.reserveTokens`), the live model is asked to hand
- *    off its working state through the `save_checkpoint` tool (or a plain-text
- *    `## Checkpoint` message as a fallback). The text is captured out-of-band as a
- *    durable custom entry and prepended **verbatim** to the next compaction summary,
- *    so in-progress work, touched files, decisions and next steps survive
- *    byte-for-byte instead of being re-summarized.
+ * 1. Mid-run trigger. pi's mid-run threshold check silently does nothing when the
+ *    newest turn's tool results alone exceed `compaction.keepRecentTokens` (default
+ *    20000): the cut-point search degenerates, nothing is left to summarize, and
+ *    `_runAutoCompaction` returns before emitting anything (upstream issue #9740).
+ *    The post-run check masks that in ordinary sessions, but a `/goal` run never ends,
+ *    so the context overshoots. This extension therefore compacts itself once the
+ *    context crosses `contextWindow - reserveTokens`, aborts + compacts, and resumes
+ *    the paused goal afterwards.
  *
- * 2. Goal-aware summaries. While a /goal (pi-goal) is active, the summary prompt
- *    carries the goal objective, status and budget, and the summary is generated
- *    with a bounded output budget (SUMMARY_MAX_TOKENS) instead of pi's
- *    reserveTokens-derived budget, which can be as large as the model's max output.
+ * 2. Turn-boundary recovery. `ctx.compact()` is the manual compaction path, and pi can
+ *    only cut at a user/assistant message - never at a tool result. When the last entry
+ *    is a tool result (the usual state mid-run) compaction fails with "Nothing to
+ *    compact". The extension then asks the model for one short plain assistant turn,
+ *    which gives pi a valid cut point, and compacts on the following turn.
  *
- * Hooks used:
- *   session_start          reset per-session state and read compaction settings
- *   turn_end               request a checkpoint short of the threshold; capture a
- *                          plain-text checkpoint reply
- *   session_before_compact supply the goal-aware summary and fold in the checkpoint
- *   session_compact        re-arm the checkpoint prompt for the next context climb
+ * 3. Pre-compaction checkpoint. A fixed amount of tokens *before* the trigger, the live
+ *    model is asked to hand off its working state through the `save_checkpoint` tool (or
+ *    a plain-text `## Checkpoint` message). The text is captured out-of-band as a durable
+ *    custom entry and prepended **verbatim** to the compaction summary, so in-progress
+ *    work, touched files, decisions and next steps survive byte-for-byte.
+ *
+ * 4. Goal-aware summaries. While a /goal (pi-goal) is active, the summary prompt carries
+ *    the goal objective, status and budget, and the summary is produced with a bounded
+ *    output budget (SUMMARY_MAX_TOKENS) instead of pi's reserveTokens-derived budget.
+ *
+ * Once upstream #9740 is fixed, mechanisms 1 and 2 become redundant (they duplicate a
+ * compaction pi would then do correctly). Mechanisms 3 and 4 stay useful either way.
  *
  * Configuration lives in pi's own `compaction` settings; see README.md.
  */
@@ -46,7 +52,7 @@ const SUMMARY_MAX_TOKENS = 8192;
 /** Fallback reserve when no `compaction.reserveTokens` is configured (pi's default). */
 const DEFAULT_RESERVE_TOKENS = 16384;
 /**
- * Tokens of headroom between the checkpoint prompt and pi's compaction trigger.
+ * Tokens of headroom between the checkpoint prompt and the compaction trigger.
  * With the documented 616000 reserve on a 1M window (trigger ~384k) this fires at
  * ~368k. Override with `PI_GOAL_PREP_LEAD_TOKENS`.
  */
@@ -59,6 +65,10 @@ const CHECKPOINT_ENTRY_TYPE = "pi-goal-checkpoint";
 const MAX_CHECKPOINT_CHARS = 16000;
 /** Matches the `## Checkpoint` heading the model emits as a plain-text fallback. */
 const CHECKPOINT_MARKER = /^##\s*Checkpoint\b/m;
+/** pi's error when there is no valid cut point to compact at. */
+const NOTHING_TO_COMPACT = "Nothing to compact";
+/** pi's error when a compaction already ran and the context did not need another. */
+const ALREADY_COMPACTED = "Already compacted";
 
 interface CompactionConfig {
 	enabled: boolean;
@@ -121,8 +131,7 @@ function readJson(path: string): Record<string, unknown> | null {
 
 /**
  * Read `compaction.reserveTokens` the same way pi does: global settings first,
- * then project `.pi/settings.json` overrides, matching pi's precedence. Only used
- * to place the checkpoint prompt relative to pi's own threshold.
+ * then project `.pi/settings.json` overrides, matching pi's precedence.
  */
 function compactionSettings(cwd: string): CompactionConfig {
 	const agentDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
@@ -194,7 +203,7 @@ function readGoal(ctx: ExtensionContext): ThreadGoalLike | null {
 }
 
 // ---------------------------------------------------------------------------
-// Compaction summary (goal-aware when a goal is active)
+// Prompts
 // ---------------------------------------------------------------------------
 
 function goalBlock(goal: ThreadGoalLike): string {
@@ -297,11 +306,10 @@ ${conversationText}
 }
 
 /**
- * Prompt injected shortly before pi compacts, asking the live model (which still
+ * Prompt injected shortly before the trigger, asking the live model (which still
  * holds its full working state) to hand off a checkpoint via the
  * `save_checkpoint` tool. The tool captures the text out-of-band so it can be
- * carried verbatim through compaction instead of being re-summarized. pi's own
- * threshold compaction then does the actual compaction.
+ * carried verbatim through compaction instead of being re-summarized.
  */
 function buildPrepPrompt(goal: ThreadGoalLike | null): string {
 	const goalContext = goal ? `${goalBlock(goal)}\n\n` : "";
@@ -327,7 +335,34 @@ Write the checkpoint in this EXACT structure:
 Be precise and complete but concise. Preserve exact file paths, function names, command outputs, and error messages verbatim. This checkpoint will be carried verbatim through compaction, so it must stand alone.`;
 }
 
+/**
+ * Ask for one short plain assistant turn. pi can only cut at a user/assistant
+ * message, never at a tool result, so a run whose last entry is a tool result has
+ * nothing to compact at. A single assistant message creates that cut point.
+ */
+function buildTurnBoundaryPrompt(goal: ThreadGoalLike | null): string {
+	const goalContext = goal ? `${goalSummaryLine(goal)}\n\n` : "";
+	return `## Compaction needs a turn boundary
+
+Your context is over the compaction threshold, but the last entry in this session is a tool result, and pi cannot summarize from there. Do not call any tools. Reply with one short sentence describing what you are doing right now, then stop. You will be resumed right after compaction.
+
+${goalContext}If it helps the summary, include in that sentence the exact file paths you are currently working on. Nothing else.`;
+}
+
+function goalSummaryLine(goal: ThreadGoalLike): string {
+	return `Active goal: ${goal.objective}`;
+}
+
 export default function goalCompactExtension(pi: ExtensionAPI) {
+	// Set only while a compaction this extension requested is in flight, so a
+	// compaction pi triggered on its own (or a user /compact) is never followed
+	// by a resume.
+	let midRunCompactionArmed = false;
+	// Context size at the last mid-run trigger. Guards against a compact/resume
+	// loop when a compaction completes but the context does not drop below the
+	// threshold (e.g. a huge kept tail). Re-armed when context falls back under
+	// the threshold.
+	let lastTriggerTokens: number | null = null;
 	// Whether the pre-compaction checkpoint prompt has been injected for the
 	// current compaction cycle. Re-armed when context drops back below the prep
 	// threshold (i.e. after a compaction).
@@ -335,6 +370,9 @@ export default function goalCompactExtension(pi: ExtensionAPI) {
 	// Checkpoint text captured by the save_checkpoint tool, awaiting the next
 	// compaction so it can be carried verbatim into the summary.
 	let pendingCheckpoint: string | null = null;
+	// Set after a compaction failed for lack of a cut point; cleared once a short
+	// assistant turn has been requested (and again after a successful compaction).
+	let awaitingAssistantTurn = false;
 	let settings: CompactionConfig | null = null;
 
 	// The model hands off its working state through this tool. Capturing it here
@@ -369,17 +407,97 @@ export default function goalCompactExtension(pi: ExtensionAPI) {
 		},
 	});
 
+	// Shared compaction trigger: notify, abort + compact, then resume the paused
+	// goal once compaction completes (or if pi's native pass wins the race).
+	const compactNow = (ctx: ExtensionContext): void => {
+		midRunCompactionArmed = true;
+		const usage = ctx.getContextUsage();
+		const tokens = usage?.tokens ?? null;
+		ctx.ui.notify(
+			`Context at ${tokens !== null ? tokens.toLocaleString() : "unknown"} tokens, compacting mid-goal...`,
+			"info",
+		);
+
+		// The abort that precedes compaction pauses the goal. Resume on a fresh
+		// tick, after pi has cleared _compactionAbortController. Re-check a few
+		// times because the pause can land on a slightly later async chain.
+		const resumeGoalIfPaused = (attempt: number) => {
+			setTimeout(() => {
+				if (readGoal(ctx)?.status === "paused") {
+					pi.sendUserMessage("/goal resume", { expandPromptTemplates: true });
+				} else if (attempt < 3) {
+					resumeGoalIfPaused(attempt + 1);
+				}
+			}, attempt === 0 ? 0 : 100);
+		};
+
+		ctx.compact({
+			onComplete: () => {
+				midRunCompactionArmed = false;
+				awaitingAssistantTurn = false;
+				resumeGoalIfPaused(0);
+			},
+			onError: (error) => {
+				midRunCompactionArmed = false;
+
+				// ctx.compact() aborts the run first; that abort produces an error
+				// turn at the run boundary, which triggers pi's own auto-compaction.
+				// When the native pass wins the race, our compact() reports
+				// "Already compacted" - the session was compacted, so resume the
+				// (now paused) goal the same way onComplete would.
+				if (error.message.includes(ALREADY_COMPACTED)) {
+					resumeGoalIfPaused(0);
+					return;
+				}
+
+				// "Nothing to compact" mid-run almost always means there is no cut
+				// point to work with, because the last entry is a tool result (the
+				// state the trigger runs in). Ask for one short assistant turn so pi
+				// has something to cut at, then compact on the following turn.
+				if (error.message.includes(NOTHING_TO_COMPACT) && !awaitingAssistantTurn) {
+					awaitingAssistantTurn = true;
+					ctx.ui.notify(
+						"Compaction has no cut point yet; asking the model for a short turn boundary.",
+						"info",
+					);
+					try {
+						pi.sendUserMessage(buildTurnBoundaryPrompt(readGoal(ctx)), { deliverAs: "steer" });
+					} catch (nudgeError) {
+						awaitingAssistantTurn = false;
+						const text = nudgeError instanceof Error ? nudgeError.message : String(nudgeError);
+						ctx.ui.notify(`Turn-boundary request failed: ${text}`, "warning");
+					}
+					return;
+				}
+
+				// Any other failure, or a second failure in the same cycle: no
+				// compaction happened, so leave the goal paused, stop retrying at this
+				// context level, and surface the error. The captured checkpoint stays
+				// pending so a later successful compaction still carries it.
+				awaitingAssistantTurn = false;
+				ctx.ui.notify(`Mid-goal compaction failed: ${error.message}`, "warning");
+			},
+		});
+	};
+
 	pi.on("session_start", async (_event, ctx) => {
+		midRunCompactionArmed = false;
+		lastTriggerTokens = null;
 		prepInjected = false;
 		pendingCheckpoint = null;
+		awaitingAssistantTurn = false;
 		settings = compactionSettings(ctx.cwd);
 	});
 
-	// Decide when to ask for a checkpoint. The prompt is injected a fixed amount of
-	// tokens *before* pi's threshold (contextWindow - reserveTokens) so the captured
-	// state is folded into the compaction that follows. Compaction itself is pi's
-	// job: this hook never triggers it.
+	// Mid-run trigger. pi's own mid-run check can silently no-op (upstream #9740),
+	// so this hook drives compaction from the turn boundary instead: once a
+	// checkpoint is captured, once the context crosses the threshold, or once a
+	// requested turn boundary has been produced.
 	pi.on("turn_end", async (event, ctx) => {
+		if (midRunCompactionArmed) {
+			return;
+		}
+
 		const message = event.message as { role?: string; stopReason?: string; content?: unknown };
 		if (message.role !== "assistant") {
 			return;
@@ -395,9 +513,25 @@ export default function goalCompactExtension(pi: ExtensionAPI) {
 			return;
 		}
 
-		// Plain-text fallback: the model replied to the prep prompt with a
-		// `## Checkpoint` message instead of calling the tool. Capture it verbatim;
-		// the next compaction folds it into the summary.
+		// 0) The requested turn boundary arrived: the branch now ends with an
+		//    assistant message, so pi has a cut point and compaction can proceed.
+		if (awaitingAssistantTurn && message.stopReason !== "toolUse") {
+			awaitingAssistantTurn = false;
+			compactNow(ctx);
+			return;
+		}
+
+		// 1) Compact once the requested checkpoint has been captured. A voluntary
+		//    save_checkpoint call (the model also records progress at milestones) is
+		//    left stashed and folded into the next threshold compaction instead.
+		if (pendingCheckpoint !== null && prepInjected) {
+			compactNow(ctx);
+			return;
+		}
+
+		// 2) Plain-text fallback: the model replied with a `## Checkpoint` message
+		//    instead of calling the tool. Capture it and compact now, exactly like
+		//    the tool path.
 		if (prepInjected) {
 			const text = extractCheckpointText(message);
 			if (text !== null) {
@@ -407,13 +541,14 @@ export default function goalCompactExtension(pi: ExtensionAPI) {
 					goalId: goal.goalId ?? null,
 					at: Date.now(),
 				});
-				ctx.ui.notify("Captured plain-text checkpoint for the next compaction.", "info");
+				ctx.ui.notify("Captured plain-text checkpoint, compacting...", "info");
+				compactNow(ctx);
 				return;
 			}
 		}
 
-		// Only tool-use turns are actively working. A natural stop ends the goal's
-		// turn; pi still checks its own threshold at run end.
+		// Only tool-use turns continue the same run. A natural "stop" is handled by
+		// pi's own check at the run end.
 		if (message.stopReason !== "toolUse") {
 			return;
 		}
@@ -425,15 +560,26 @@ export default function goalCompactExtension(pi: ExtensionAPI) {
 		const threshold = usage.contextWindow - config.reserveTokens;
 		const prepThreshold = threshold - prepLeadTokens();
 
+		if (usage.tokens > threshold) {
+			if (lastTriggerTokens !== null && usage.tokens >= lastTriggerTokens) {
+				// A compaction already ran at this context level (or higher) and did
+				// not reduce the context below it. Retrying would loop; leave it to
+				// the turn-boundary path or the user.
+				return;
+			}
+			lastTriggerTokens = usage.tokens;
+			compactNow(ctx);
+			return;
+		}
+
+		// Back under the compaction threshold: re-arm the loop guards.
+		lastTriggerTokens = null;
+		awaitingAssistantTurn = false;
+
 		if (usage.tokens <= prepThreshold) {
 			// Dropped back below the prep threshold (e.g. after a compaction):
 			// re-arm the checkpoint prompt for the next cycle.
 			prepInjected = false;
-			return;
-		}
-		if (usage.tokens > threshold) {
-			// pi's threshold compaction is already due. Asking for a checkpoint now
-			// would land after it, so leave the cycle alone.
 			return;
 		}
 		if (prepInjected) {
@@ -586,5 +732,6 @@ export default function goalCompactExtension(pi: ExtensionAPI) {
 	// the prep threshold.
 	pi.on("session_compact", async () => {
 		prepInjected = false;
+		awaitingAssistantTurn = false;
 	});
 }
