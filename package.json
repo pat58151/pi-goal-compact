@@ -4,6 +4,19 @@
   "description": "Goal-aware context compaction for pi: mid-run compaction triggers plus verbatim pre-compaction checkpoints.",
   "type": "module",
   "license": "MIT",
+  "files": [
+    "extensions",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pat58151/pi-goal-compact.git"
+  },
+  "homepage": "https://github.com/pat58151/pi-goal-compact#readme",
+  "bugs": {
+    "url": "https://github.com/pat58151/pi-goal-compact/issues"
+  },
   "keywords": [
     "pi-package",
     "pi",
