@@ -16,15 +16,20 @@ Makes pi's compactions preserve working state instead of re-summarizing it away,
    `contextWindow - reserveTokens`, then resumes the paused goal.
 
 2. **Turn-boundary recovery.** `ctx.compact()` can only cut at a user or assistant message, never
-   at a tool result. If compaction fails with "Nothing to compact" because the last entry is a
+   at a tool result. If compaction fails with "Nothing to compact" and the branch really ends at a
    tool result, the extension asks the model for one short plain assistant turn, which gives pi a
-   cut point, and compacts on the following turn.
+   cut point, and compacts on the following turn. This is attempted at most once per context level.
+   Any other refusal is terminal: pi is then saying the history itself is not summarizable at that
+   size, so the extension stops attempting a compaction until the context changes instead of
+   spending a model turn per retry.
 
 3. **Pre-compaction checkpoint.** A fixed number of tokens before the trigger, the live model is
    asked to hand off its working state through a `save_checkpoint` tool (or a plain-text
    `## Checkpoint` message). The text is captured out-of-band as a durable session entry and
-   prepended **verbatim** to the compaction summary, so in-progress work, touched files, decisions,
-   next steps and exact paths/errors survive byte-for-byte.
+   prepended **verbatim** to the next compaction summary, so in-progress work, touched files,
+   decisions, next steps and exact paths/errors survive byte-for-byte. Capturing a checkpoint does
+   not itself trigger compaction: it waits for the real threshold crossing, so it always lands in a
+   compaction pi agrees to perform.
 
 4. **Goal-aware summaries.** While a `/goal` is active, the summary prompt carries the goal
    objective, status and budget, and the summary is generated with a bounded `SUMMARY_MAX_TOKENS`
@@ -46,7 +51,7 @@ the extension always carries its own trigger, so it behaves the same on every pi
 ## Install
 
 ```sh
-pi install git:github.com/pat58151/pi-goal-compact@v1.1.1
+pi install git:github.com/pat58151/pi-goal-compact@v1.1.2
 pi install npm:pi-codex-goal          # for the goal-aware behavior
 ```
 
@@ -83,18 +88,27 @@ So the documented setup asks for a checkpoint at ~368k and compacts at ~384k. Ke
 
 ## Verification
 
-Tested with an SDK harness driving a real goal-shaped run (a `pi-codex-goal` goal entry plus large
-tool results), on stock 0.85.1 and on a 0.85.1 with the upstream fix applied locally:
+Tested with SDK harnesses driving goal-shaped runs (a `pi-codex-goal` goal entry plus large tool
+results), on stock 0.85.1 and on a 0.85.1 with the upstream fix applied locally:
 
 | Scenario | Stock 0.85.1 | With the fix applied |
 | --- | --- | --- |
 | Checkpoint captured, folded into the summary | yes, verbatim | yes, verbatim |
 | Context crossing the threshold mid-goal | compacts (abort + resume) | compacts (native, then the trigger's pass) |
+| A refusal pi will not perform | one attempt, then quiet | one attempt, then quiet |
 | Repeated crossings in a continuing run | nothing unbounded | nothing unbounded |
 
-The turn-boundary recovery path is defensive: it is the branch v1.0.0 hit in practice
-("Nothing to compact"), and it did not trigger in these runs because pi's abort added an assistant
-message that supplied a cut point.
+The turn-boundary recovery path is defensive. It is the branch v1.0.0 hit in practice ("Nothing to
+compact"), and it rarely fires on its own because the abort that precedes `ctx.compact()` appends
+an assistant message, which already supplies a cut point. v1.1.2 therefore also treats a refusal as
+terminal rather than retrying it.
+
+Fixed in v1.1.2: capturing a checkpoint used to compact immediately, at a context size pi can
+refuse ("Nothing to compact (session too small)"). Each refusal asked for a new turn boundary, the
+boundary turn re-entered the same path, and the cycle repeated without limit - one model turn per
+attempt, context drifting upward, nothing ever compacted. Reproduced deterministically with a
+context below `keepRecentTokens` at the prep point, which is what happens whenever
+`keepRecentTokens >= contextWindow - reserveTokens - PI_GOAL_PREP_LEAD_TOKENS`.
 
 ## Notes and caveats
 
@@ -104,8 +118,13 @@ message that supplied a cut point.
   `/goal resume` when compaction completes. Expect a brief pause at each trigger.
 - The trigger only fires on tool-use turns while a goal is active, at most once per context level,
   and re-arms once the context drops back below the threshold.
-- A captured checkpoint is consumed by the next compaction and is never reused. If summarization
-  fails, the checkpoint alone becomes the summary rather than being lost.
+- A refused compaction is not retried. The extension records the context size where pi refused and
+  stays quiet until the context drops back below it, or until a compaction happens for another
+  reason (`/compact`, pi's own post-run check). The goal is resumed either way, because the abort
+  that precedes `ctx.compact()` pauses it.
+- A captured checkpoint is folded into the next compaction that actually completes, and is
+  cleared then. A cancelled or failed compaction does not consume it, so the text is never lost;
+  if summarization fails outright, the checkpoint alone becomes the summary.
 - Goal state is read from pi session entries, so it survives resume, fork, and reload without
   external state.
 

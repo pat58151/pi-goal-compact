@@ -19,7 +19,14 @@
  *    only cut at a user/assistant message - never at a tool result. When the last entry
  *    is a tool result (the usual state mid-run) compaction fails with "Nothing to
  *    compact". The extension then asks the model for one short plain assistant turn,
- *    which gives pi a valid cut point, and compacts on the following turn.
+ *    which gives pi a valid cut point, and compacts on the following turn. This is
+ *    attempted at most once per context level and only while the last entry really is a
+ *    tool result; any other refusal is terminal, because pi is then saying the history
+ *    itself is not summarizable and no turn boundary can change that.
+ *
+ *    The checkpoint capture path does not compact on its own. It waits until the context
+ *    is genuinely over the threshold, so a captured checkpoint is folded into a real
+ *    threshold compaction instead of forcing one pi would refuse.
  *
  * 3. Pre-compaction checkpoint. A fixed amount of tokens *before* the trigger, the live
  *    model is asked to hand off its working state through the `save_checkpoint` tool (or
@@ -119,6 +126,25 @@ function extractCheckpointText(message: { role?: string; content?: unknown }): s
 		return null;
 	}
 	return CHECKPOINT_MARKER.test(text) ? text : null;
+}
+
+/**
+ * True when the branch ends at a tool result, which is the only state a one-line
+ * assistant turn can fix: pi can cut at a user/assistant message and never at a tool
+ * result, so the cut-point search has nothing to land on. Metadata entries (pi-goal
+ * appends its own goal entries on every turn and on abort) carry no context message,
+ * so they are skipped exactly like pi's own cut-point scan skips them.
+ */
+function lastEntryIsToolResult(ctx: ExtensionContext): boolean {
+	const branch = ctx.sessionManager.getBranch();
+	for (let i = branch.length - 1; i >= 0; i--) {
+		const entry = branch[i] as { type?: string; message?: { role?: string } };
+		if (entry.type !== "message") {
+			continue;
+		}
+		return entry.message?.role === "toolResult";
+	}
+	return false;
 }
 
 function readJson(path: string): Record<string, unknown> | null {
@@ -373,7 +399,23 @@ export default function goalCompactExtension(pi: ExtensionAPI) {
 	// Set after a compaction failed for lack of a cut point; cleared once a short
 	// assistant turn has been requested (and again after a successful compaction).
 	let awaitingAssistantTurn = false;
+	// Set when pi refuses a compaction ("Nothing to compact") in a way a turn boundary
+	// cannot fix. While this is set no trigger path attempts another compaction: the
+	// refusal is not retryable, and retrying costs one model turn per attempt. Lifted
+	// once the context drops back below blockedAtTokens, or by a reset event (successful
+	// compaction, /compact, session start).
+	let compactionBlocked = false;
+	let blockedAtTokens: number | null = null;
+	// One-shot latch for turn-boundary recovery, so a model that answers the nudge with
+	// another tool call cannot re-enter the nudge path forever.
+	let turnBoundaryRequested = false;
 	let settings: CompactionConfig | null = null;
+
+	const clearCompactionLatch = () => {
+		compactionBlocked = false;
+		blockedAtTokens = null;
+		turnBoundaryRequested = false;
+	};
 
 	// The model hands off its working state through this tool. Capturing it here
 	// (rather than as a plain message) keeps it out of the summarization path:
@@ -419,22 +461,25 @@ export default function goalCompactExtension(pi: ExtensionAPI) {
 		);
 
 		// The abort that precedes compaction pauses the goal. Resume on a fresh
-		// tick, after pi has cleared _compactionAbortController. Re-check a few
-		// times because the pause can land on a slightly later async chain.
+		// tick, after pi has cleared _compactionAbortController. The pause lands on a
+		// later async chain (pi-goal pauses from onAgentEnd), so poll for a while
+		// instead of giving up after a few hundred milliseconds.
 		const resumeGoalIfPaused = (attempt: number) => {
+			const delay = [0, 250, 500, 1000, 2000, 3000][attempt] ?? 3000;
 			setTimeout(() => {
 				if (readGoal(ctx)?.status === "paused") {
 					pi.sendUserMessage("/goal resume", { expandPromptTemplates: true });
-				} else if (attempt < 3) {
+				} else if (attempt < 5) {
 					resumeGoalIfPaused(attempt + 1);
 				}
-			}, attempt === 0 ? 0 : 100);
+			}, delay);
 		};
 
 		ctx.compact({
 			onComplete: () => {
 				midRunCompactionArmed = false;
 				awaitingAssistantTurn = false;
+				clearCompactionLatch();
 				resumeGoalIfPaused(0);
 			},
 			onError: (error) => {
@@ -446,36 +491,71 @@ export default function goalCompactExtension(pi: ExtensionAPI) {
 				// "Already compacted" - the session was compacted, so resume the
 				// (now paused) goal the same way onComplete would.
 				if (error.message.includes(ALREADY_COMPACTED)) {
+					awaitingAssistantTurn = false;
+					clearCompactionLatch();
 					resumeGoalIfPaused(0);
 					return;
 				}
 
-				// "Nothing to compact" mid-run almost always means there is no cut
-				// point to work with, because the last entry is a tool result (the
-				// state the trigger runs in). Ask for one short assistant turn so pi
-				// has something to cut at, then compact on the following turn.
-				if (error.message.includes(NOTHING_TO_COMPACT) && !awaitingAssistantTurn) {
-					awaitingAssistantTurn = true;
-					ctx.ui.notify(
-						"Compaction has no cut point yet; asking the model for a short turn boundary.",
-						"info",
-					);
-					try {
-						pi.sendUserMessage(buildTurnBoundaryPrompt(readGoal(ctx)), { deliverAs: "steer" });
-					} catch (nudgeError) {
-						awaitingAssistantTurn = false;
-						const text = nudgeError instanceof Error ? nudgeError.message : String(nudgeError);
-						ctx.ui.notify(`Turn-boundary request failed: ${text}`, "warning");
+				if (error.message.includes(NOTHING_TO_COMPACT)) {
+					const refusedAt = ctx.getContextUsage()?.tokens ?? null;
+
+					// A turn boundary only helps when the branch really ends at a tool
+					// result, and only once per epoch. pi refuses the compaction for any
+					// other reason because the history itself is not summarizable at this
+					// size, and no assistant turn changes that.
+					const canNudge = !turnBoundaryRequested && lastEntryIsToolResult(ctx);
+
+					if (canNudge) {
+						awaitingAssistantTurn = true;
+						turnBoundaryRequested = true;
+						ctx.ui.notify(
+							"Compaction found no cut point; asking the model for a short turn boundary.",
+							"info",
+						);
+						try {
+							pi.sendUserMessage(buildTurnBoundaryPrompt(readGoal(ctx)), { deliverAs: "steer" });
+						} catch (nudgeError) {
+							awaitingAssistantTurn = false;
+							turnBoundaryRequested = false;
+							const text = nudgeError instanceof Error ? nudgeError.message : String(nudgeError);
+							ctx.ui.notify(`Turn-boundary request failed: ${text}`, "warning");
+						}
+						return;
 					}
+
+					// Terminal. pi refused this compaction, so stop attempting one at
+					// this context level instead of nudging forever. The captured
+					// checkpoint stays pending, so a later successful compaction (pi's own
+					// post-run check, a manual /compact, or a trigger once the context
+					// falls back) still carries it verbatim. Without a token count there is
+					// nothing to compare against later, so leave the latch off and simply
+					// stop here.
+					awaitingAssistantTurn = false;
+					if (refusedAt !== null) {
+						compactionBlocked = true;
+						blockedAtTokens = refusedAt;
+						ctx.ui.notify(
+							"Compaction has nothing to summarize at this context level; not retrying until the context changes.",
+							"warning",
+						);
+					}
+					// The abort that precedes ctx.compact() pauses the goal; leaving it paused
+					// would stop the run silently, so hand it back.
+					resumeGoalIfPaused(0);
 					return;
 				}
 
-				// Any other failure, or a second failure in the same cycle: no
-				// compaction happened, so leave the goal paused, stop retrying at this
-				// context level, and surface the error. The captured checkpoint stays
-				// pending so a later successful compaction still carries it.
+				// Any other failure: no compaction happened, so surface the error and
+				// stop attempting one at this context level rather than looping.
+				const failedAt = ctx.getContextUsage()?.tokens ?? null;
 				awaitingAssistantTurn = false;
+				if (failedAt !== null) {
+					compactionBlocked = true;
+					blockedAtTokens = failedAt;
+				}
 				ctx.ui.notify(`Mid-goal compaction failed: ${error.message}`, "warning");
+				resumeGoalIfPaused(0);
 			},
 		});
 	};
@@ -486,13 +566,15 @@ export default function goalCompactExtension(pi: ExtensionAPI) {
 		prepInjected = false;
 		pendingCheckpoint = null;
 		awaitingAssistantTurn = false;
+		clearCompactionLatch();
 		settings = compactionSettings(ctx.cwd);
 	});
 
 	// Mid-run trigger. pi's own mid-run check can silently no-op (upstream #9740),
-	// so this hook drives compaction from the turn boundary instead: once a
-	// checkpoint is captured, once the context crosses the threshold, or once a
-	// requested turn boundary has been produced.
+	// so this hook drives compaction from the turn boundary instead: once the context
+	// crosses the threshold, or once a requested turn boundary has been produced. A
+	// captured checkpoint never compacts on its own; it rides along with the next
+	// threshold compaction.
 	pi.on("turn_end", async (event, ctx) => {
 		if (midRunCompactionArmed) {
 			return;
@@ -513,25 +595,35 @@ export default function goalCompactExtension(pi: ExtensionAPI) {
 			return;
 		}
 
+		const usage = ctx.getContextUsage();
+		const tokens = usage?.tokens ?? null;
+		if (compactionBlocked) {
+			if (tokens === null || blockedAtTokens === null || tokens >= blockedAtTokens) {
+				// pi already refused a compaction at this context level, and the refusal is
+				// not retryable. Stay quiet until the context drops below where it was
+				// refused instead of spending a model turn per attempt.
+				return;
+			}
+			clearCompactionLatch();
+		}
+		const threshold = usage ? usage.contextWindow - config.reserveTokens : null;
+		const prepThreshold = threshold === null ? null : threshold - prepLeadTokens();
+
 		// 0) The requested turn boundary arrived: the branch now ends with an
-		//    assistant message, so pi has a cut point and compaction can proceed.
+		//    assistant message, so pi has a cut point and compaction can proceed. Only
+		//    if the context is still over the threshold, since the point of the nudge
+		//    was the compaction that was due.
 		if (awaitingAssistantTurn && message.stopReason !== "toolUse") {
 			awaitingAssistantTurn = false;
-			compactNow(ctx);
+			if (tokens !== null && threshold !== null && tokens > threshold) {
+				compactNow(ctx);
+			}
 			return;
 		}
 
-		// 1) Compact once the requested checkpoint has been captured. A voluntary
-		//    save_checkpoint call (the model also records progress at milestones) is
-		//    left stashed and folded into the next threshold compaction instead.
-		if (pendingCheckpoint !== null && prepInjected) {
-			compactNow(ctx);
-			return;
-		}
-
-		// 2) Plain-text fallback: the model replied with a `## Checkpoint` message
-		//    instead of calling the tool. Capture it and compact now, exactly like
-		//    the tool path.
+		// 1) Plain-text fallback: the model replied with a `## Checkpoint` message
+		//    instead of calling the tool. Capture it; it is folded into the next
+		//    threshold compaction below, exactly like the tool path.
 		if (prepInjected) {
 			const text = extractCheckpointText(message);
 			if (text !== null) {
@@ -541,9 +633,7 @@ export default function goalCompactExtension(pi: ExtensionAPI) {
 					goalId: goal.goalId ?? null,
 					at: Date.now(),
 				});
-				ctx.ui.notify("Captured plain-text checkpoint, compacting...", "info");
-				compactNow(ctx);
-				return;
+				ctx.ui.notify("Captured plain-text checkpoint for the next compaction.", "info");
 			}
 		}
 
@@ -553,30 +643,28 @@ export default function goalCompactExtension(pi: ExtensionAPI) {
 			return;
 		}
 
-		const usage = ctx.getContextUsage();
-		if (!usage || usage.tokens === null) {
+		if (tokens === null || threshold === null || prepThreshold === null) {
 			return;
 		}
-		const threshold = usage.contextWindow - config.reserveTokens;
-		const prepThreshold = threshold - prepLeadTokens();
 
-		if (usage.tokens > threshold) {
-			if (lastTriggerTokens !== null && usage.tokens >= lastTriggerTokens) {
+		if (tokens > threshold) {
+			if (lastTriggerTokens !== null && tokens >= lastTriggerTokens) {
 				// A compaction already ran at this context level (or higher) and did
 				// not reduce the context below it. Retrying would loop; leave it to
-				// the turn-boundary path or the user.
+				// pi or the user.
 				return;
 			}
-			lastTriggerTokens = usage.tokens;
+			lastTriggerTokens = tokens;
 			compactNow(ctx);
 			return;
 		}
 
-		// Back under the compaction threshold: re-arm the loop guards.
+		// Back under the compaction threshold: re-arm the loop guards for the next epoch.
 		lastTriggerTokens = null;
 		awaitingAssistantTurn = false;
+		turnBoundaryRequested = false;
 
-		if (usage.tokens <= prepThreshold) {
+		if (tokens <= prepThreshold) {
 			// Dropped back below the prep threshold (e.g. after a compaction):
 			// re-arm the checkpoint prompt for the next cycle.
 			prepInjected = false;
@@ -597,7 +685,7 @@ export default function goalCompactExtension(pi: ExtensionAPI) {
 
 		prepInjected = true;
 		ctx.ui.notify(
-			`Context at ${usage.tokens.toLocaleString()} tokens, asking the model to record a pre-compaction checkpoint...`,
+			`Context at ${tokens.toLocaleString()} tokens, asking the model to record a pre-compaction checkpoint...`,
 			"info",
 		);
 		try {
@@ -612,10 +700,11 @@ export default function goalCompactExtension(pi: ExtensionAPI) {
 	pi.on("session_before_compact", async (event, ctx) => {
 		const goal = readGoal(ctx);
 
-		// Consume any pending checkpoint captured by the save_checkpoint tool, so
-		// it is folded verbatim into this summary and never reused later.
+		// Read the checkpoint without consuming it: this hook also runs for compactions
+		// that pi cancels or that fail afterwards, and a captured checkpoint must survive
+		// those. It is cleared in session_compact, which only fires on a successful
+		// compaction, so a failed attempt still carries it into the next one.
 		const checkpoint = pendingCheckpoint;
-		pendingCheckpoint = null;
 
 		const { preparation, signal } = event;
 		const { messagesToSummarize, turnPrefixMessages, tokensBefore, firstKeptEntryId, previousSummary } =
@@ -733,5 +822,8 @@ export default function goalCompactExtension(pi: ExtensionAPI) {
 	pi.on("session_compact", async () => {
 		prepInjected = false;
 		awaitingAssistantTurn = false;
+		// Only a compaction that actually happened consumes the captured checkpoint.
+		pendingCheckpoint = null;
+		clearCompactionLatch();
 	});
 }
